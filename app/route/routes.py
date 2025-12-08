@@ -1,5 +1,6 @@
 from flask import Blueprint, jsonify, request
 import requests
+from sqlalchemy import func
 
 from app.models.model import Food
 
@@ -151,3 +152,15 @@ def filter():
     # Execute query and return results
     results = q.all()
     return jsonify([food.to_dict() for food in results]), 200
+
+
+@main_bp.route("/random", methods=["GET"])
+def get_random_food():
+    """Get a random food item from the database and return it as a dictionary"""
+    random_food = Food.query.order_by(func.random()).first()
+    if random_food:
+        return jsonify(random_food.to_dict()), 200
+    else:
+        return jsonify({"error": "Couldn't return an item from the database"}), 404
+    
+    
