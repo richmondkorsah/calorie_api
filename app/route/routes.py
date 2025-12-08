@@ -35,9 +35,9 @@ def search_food():
         return jsonify({"error": "Query parameter 'q' is required"}), 400
     
     if query:
-        return jsonify([food.to_dict() for food in search_result])
+        return jsonify([food.to_dict() for food in search_result]), 200
     else:
-        return jsonify({"error": "Food not found"})
+        return jsonify({"error": "Food not found"}), 404
     
     
 # This endpoint gets all unique food categories from the database
@@ -46,7 +46,98 @@ def get_all_categories():
     categories = Food.query.with_entities(Food.category_name).distinct().all()
     """Query all distinct categories and return them as a list"""
     category_list = [category[0] for category in categories]
-    return jsonify({
-        "count": len(category_list),
-        "categories": category_list
-    })
+    if categories:
+        return jsonify({
+            "count": len(category_list),
+            "categories": category_list
+        }), 200
+    else:
+        return jsonify({"error": "No categories found"}), 404
+    
+
+@main_bp.route("/category/<string:category_name>", methods=["GET"])
+def get_category(category_name):
+    get_category_name = Food.query.filter(Food.category_name.ilike(f'%{category_name}%')).all()
+    if get_category_name:
+        return jsonify([category_name.to_dict() for category_name in get_category_name]), 200
+    else:
+        return jsonify({"error": "category not found"}), 404
+    
+
+@main_bp.route("/brands", methods=["GET"])
+def get_all_brands():
+    brands = Food.query.with_entities(Food.brand_name).distinct().all()
+    
+    brand_list = [brand[0] for brand in brands]
+    if brands:
+        return jsonify({
+            "count": len(brand_list),
+            "brands": brand_list
+        }), 200
+    else:
+        return jsonify({"error": "No brands found"}), 404
+    
+
+@main_bp.route("/brands/<string:brand_name>", methods=["GET"])
+def get_brand(brand_name):
+    get_brand_name = Food.query.filter(Food.brand_name.ilike(f'%{brand_name}%')).all()
+    if get_brand_name:
+        return jsonify([brand_name.to_dict() for brand_name in get_brand_name]), 200
+    else:
+        return jsonify({"error": "brand not found"}), 404
+    
+
+@main_bp.route("/filter", methods=["GET"])
+def filter():
+    q = Food.query
+    
+    max_cal = request.args.get("max_cal", type=float)
+    min_cal = request.args.get("min_cal", type=float)
+    
+    if max_cal is not None:
+        q = q.filter(Food.calories <= max_cal)
+    if min_cal is not None:
+        q = q.filter(Food.calories >= min_cal)
+        
+    
+    max_serving_size = request.args.get("max_ss", type=float)
+    min_serving_size = request.args.get("min_ss", type=float)
+    
+    if max_serving_size is not None:
+        q = q.filter(Food.serving_size <= max_serving_size)
+    if min_serving_size is not None:
+        q = q.filter(Food.serving_size >= min_serving_size)
+    
+    
+    max_protein = request.args.get("max_protein", type=float)
+    min_protein = request.args.get("min_protein", type=float)
+    
+    if max_protein is not None:
+        q = q.filter(Food.protein_g <= max_protein)
+    if min_protein is not None:
+        q = q.filter(Food.protein_g >= min_protein)
+        
+    
+    max_carbs = request.args.get("max_carbs", type=float)
+    min_carbs = request.args.get("min_carbs", type=float)
+    
+    if max_carbs is not None:
+        q = q.filter(Food.carbs_g <= max_carbs)
+    if min_carbs is not None:
+        q = q.filter(Food.carbs_g >= min_carbs)
+    
+    
+    max_fat = request.args.get("max_fat", type=float)
+    min_fat = request.args.get("min_fat", type=float)
+    
+    if max_fat is not None:
+        q = q.filter(Food.fat_g <= max_fat)
+    if min_fat is not None:
+        q = q.filter(Food.fat_g >= min_fat)    
+        
+    page_limit = request.args.get("limit", type=int)
+    if page_limit is not None:
+        q = q.limit(page_limit)    
+    
+    results = q.all()
+    return jsonify([food.to_dict() for food in results])
