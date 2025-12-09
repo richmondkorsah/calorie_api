@@ -1,6 +1,6 @@
 from flask import Blueprint, jsonify, request
-import requests
 from sqlalchemy import func
+import requests
 
 from app.models.model import Food
 
