@@ -162,5 +162,28 @@ def get_random_food():
         return jsonify(random_food.to_dict()), 200
     else:
         return jsonify({"error": "Couldn't return an item from the database"}), 404
+
+
+# This endpoint retrieves multiple foods by their IDs in a single request
+@main_bp.route("/foods/bulk", methods=["POST"])
+def get_bulk_foods():
+    """Get multiple foods by their IDs. Request body should contain a list of food IDs"""
+    data = request.get_json()
+    
+    if not data or 'ids' not in data:
+        return jsonify({"error": "Request body must contain 'ids' field with a list of food IDs"}), 400
+    
+    food_ids = data['ids']
+    
+    if not isinstance(food_ids, list):
+        return jsonify({"error": "'ids' must be a list"}), 400
+    
+    if len(food_ids) == 0:
+        return jsonify([]), 200
+    
+    # Query for all foods matching the provided IDs
+    foods = Food.query.filter(Food.id.in_(food_ids)).all()
+    
+    return jsonify([food.to_dict() for food in foods]), 200
     
     
