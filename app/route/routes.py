@@ -64,6 +64,34 @@ def search_food():
     else:
         return jsonify({"error": "Food not found"}), 404
     
+
+@main_bp.route("/search/advanced", methods=["GET"])
+def advanced_search():
+    """Search by name, category, and brand simultaneously"""
+    name = request.args.get("name")
+    category = request.args.get("category")
+    brand = request.args.get("brand")
+    page = request.args.get("page", 1, type=int)
+    per_page = request.args.get("per_page", 20, type=int)
+    
+    q = Food.query
+    
+    if name:
+        q = q.filter(Food.name.ilike(f'%{name}%'))
+    if category:
+        q = q.filter(Food.category_name.ilike(f'%{category}%'))
+    if brand:
+        q = q.filter(Food.brand_name.ilike(f'%{brand}%'))
+    
+    pagination = q.paginate(page=page, per_page=per_page, error_out=False)
+    
+    return jsonify({
+        "foods": [food.to_dict() for food in pagination.items],
+        "total": pagination.total,
+        "page": pagination.page,
+        "per_page": pagination.per_page
+    }), 200
+  
     
 # This endpoint gets all unique food categories from the database
 # Returns: Count and list of all distinct category names
@@ -214,16 +242,6 @@ def get_top_protein():
     top_foods = Food.query.order_by(Food.protein_g.desc()).limit(limit).all()
     
     return jsonify([food.to_dict() for food in top_foods]), 200
-
-
-# Get lowest calorie foods
-@main_bp.route("/top/low-calorie", methods=["GET"])
-def get_low_calorie():
-    """Get lowest calorie foods"""
-    limit = request.args.get("limit", 10, type=int)
-    low_cal_foods = Food.query.order_by(Food.calories.asc()).limit(limit).all()
-    
-    return jsonify([food.to_dict() for food in low_cal_foods]), 200
 
 
 # Get high calorie foods
