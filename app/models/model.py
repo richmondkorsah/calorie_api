@@ -4,14 +4,14 @@ from datetime import datetime
 # Initialise SQLAlchemy
 db = SQLAlchemy()
 
-class logs(db.Model):
+""" class logs(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     food_name = db.Column(db.String(255), nullable=False)
     calories = db.Column(db.Integer, nullable=False)
     protein = db.Column(db.Integer, nullable=False)
     fat = db.Column(db.Integer, nullable=False)
     carbohydrates = db.Column(db.Integer, nullable=False)
-    timestamp = db.Column(db.DateTime, default=datetime.now)
+    timestamp = db.Column(db.DateTime, default=datetime.now) """
     
 class Food(db.Model):
     __tablename__ = 'foods'
