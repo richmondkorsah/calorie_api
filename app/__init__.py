@@ -17,7 +17,7 @@ def create_app():
     db.init_app(app)
     
     app.register_blueprint(main_bp, url_prefix="/api")
-    app.register_blueprint(image_bp, url_prefix="/api")
+    app.register_blueprint(image_bp, url_prefix="/api/image")
     app.register_blueprint(stat_bp, url_prefix="/api")
     app.register_blueprint(batch_bp, url_prefix="/api")
     app.register_blueprint(health_bp, url_prefix="/api")

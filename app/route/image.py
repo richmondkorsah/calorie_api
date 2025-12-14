@@ -3,6 +3,7 @@ from huggingface_hub import InferenceClient
 import os
 import base64
 from io import BytesIO
+from PIL import Image
 
 from app.models.model import Food
 
@@ -39,15 +40,30 @@ def analyze_food_image():
             if file.filename == '':
                 return jsonify({"error": "No file selected"}), 400
             
-            # Read raw image bytes
-            image_bytes = file.read()
+            # Read and convert to PNG format
+            try:
+                raw_bytes = file.read()
+                img = Image.open(BytesIO(raw_bytes))
+                
+                # Convert to PNG in memory
+                img_io = BytesIO()
+                img.save(img_io, format='PNG')
+                image_bytes = img_io.getvalue()
+            except Exception as img_error:
+                return jsonify({"error": f"Invalid image file: {str(img_error)}"}), 400
         
         # Handle base64 image
         elif request.is_json:
             data = request.get_json()
             if 'image_base64' in data:
                 try:
-                    image_bytes = base64.b64decode(data['image_base64'])
+                    raw_bytes = base64.b64decode(data['image_base64'])
+                    img = Image.open(BytesIO(raw_bytes))
+                    
+                    # Convert to PNG
+                    img_io = BytesIO()
+                    img.save(img_io, format='PNG')
+                    image_bytes = img_io.getvalue()
                 except Exception as e:
                     return jsonify({"error": f"Invalid base64 image: {str(e)}"}), 400
         
@@ -57,13 +73,22 @@ def analyze_food_image():
             }), 400
         
         # Call Hugging Face food classification model
-        # Pass raw bytes directly
-        result = client.image_classification(
-            image=image_bytes,
-            model="nateraw/food"
-        )
+        try:
+            result = client.image_classification(
+                image=image_bytes,
+                model="nateraw/food"
+            )
+        except Exception as model_error:
+            return jsonify({
+                "error": "Model inference failed",
+                "details": str(model_error),
+                "suggestion": "Check API token and model availability"
+            }), 503
         
         # Get top 5 predictions
+        if not result or len(result) == 0:
+            return jsonify({"error": "No predictions returned from model"}), 500
+            
         predictions = result[:5]
         
         # Search database for matching foods
@@ -104,31 +129,50 @@ def analyze_food_advanced():
         return jsonify({"error": "Hugging Face API not configured"}), 500
     
     try:
-        image_bytes = None
+        image_input = None
         
         # Handle file upload
         if 'image' in request.files:
             file = request.files['image']
             if file.filename == '':
                 return jsonify({"error": "No file selected"}), 400
-            image_bytes = file.read()
+            try:
+                file.seek(0)
+                image_data = Image.open(file.stream)
+                image_data.verify()
+                file.seek(0)
+                image_input = file.stream
+            except Exception as img_error:
+                return jsonify({"error": f"Invalid image file: {str(img_error)}"}), 400
         
         # Handle base64 image
         elif request.is_json:
             data = request.get_json()
             if 'image_base64' in data:
-                image_bytes = base64.b64decode(data['image_base64'])
+                try:
+                    image_bytes = base64.b64decode(data['image_base64'])
+                    image_data = Image.open(BytesIO(image_bytes))
+                    image_data.verify()
+                    image_input = BytesIO(image_bytes)
+                except Exception as e:
+                    return jsonify({"error": f"Invalid base64 image: {str(e)}"}), 400
         
-        if not image_bytes:
+        if not image_input:
             return jsonify({"error": "No image provided"}), 400
         
         # Use vision language model for detailed analysis
-        result = client.image_to_text(
-            image=image_bytes,
-            model="Salesforce/blip-image-captioning-large"
-        )
+        try:
+            result = client.image_to_text(
+                image=image_input,
+                model="Salesforce/blip-image-captioning-large"
+            )
+        except Exception as model_error:
+            return jsonify({
+                "error": "Vision model inference failed",
+                "details": str(model_error)
+            }), 503
         
-        description = result
+        description = result if result else "Unable to generate description"
         
         # Extract food keywords from description
         keywords = [word for word in description.lower().split() if len(word) > 3]
@@ -166,28 +210,50 @@ def analyze_with_nutrition():
         return jsonify({"error": "Hugging Face API not configured"}), 500
     
     try:
-        image_bytes = None
+        image_input = None
         
         if 'image' in request.files:
             file = request.files['image']
             if file.filename == '':
                 return jsonify({"error": "No file selected"}), 400
-            image_bytes = file.read()
+            try:
+                file.seek(0)
+                image_data = Image.open(file.stream)
+                image_data.verify()
+                file.seek(0)
+                image_input = file.stream
+            except Exception as img_error:
+                return jsonify({"error": f"Invalid image file: {str(img_error)}"}), 400
         
         elif request.is_json:
             data = request.get_json()
             if 'image_base64' in data:
-                image_bytes = base64.b64decode(data['image_base64'])
+                try:
+                    image_bytes = base64.b64decode(data['image_base64'])
+                    image_data = Image.open(BytesIO(image_bytes))
+                    image_data.verify()
+                    image_input = BytesIO(image_bytes)
+                except Exception as e:
+                    return jsonify({"error": f"Invalid base64 image: {str(e)}"}), 400
         
-        if not image_bytes:
+        if not image_input:
             return jsonify({"error": "No image provided"}), 400
         
         # Step 1: Classify food
-        classification = client.image_classification(
-            image=image_bytes,
-            model="nateraw/food"
-        )
+        try:
+            classification = client.image_classification(
+                image=image_input,
+                model="nateraw/food"
+            )
+        except Exception as model_error:
+            return jsonify({
+                "error": "Classification failed",
+                "details": str(model_error)
+            }), 503
         
+        if not classification or len(classification) == 0:
+            return jsonify({"error": "No food detected in image"}), 404
+            
         top_prediction = classification[0]
         food_name = top_prediction['label'].replace('_', ' ')
         confidence = top_prediction['score']
@@ -198,11 +264,17 @@ def analyze_with_nutrition():
         ).limit(5).all()
         
         # Calculate average nutrition if multiple matches
-        if matching_foods:
-            avg_calories = sum(f.calories for f in matching_foods) / len(matching_foods)
-            avg_protein = sum(f.protein_g for f in matching_foods) / len(matching_foods)
-            avg_carbs = sum(f.carbs_g for f in matching_foods) / len(matching_foods)
-            avg_fat = sum(f.fat_g for f in matching_foods) / len(matching_foods)
+        if matching_foods and len(matching_foods) > 0:
+            # Filter out None values before calculating averages
+            valid_calories = [f.calories for f in matching_foods if f.calories is not None]
+            valid_protein = [f.protein_g for f in matching_foods if f.protein_g is not None]
+            valid_carbs = [f.carbs_g for f in matching_foods if f.carbs_g is not None]
+            valid_fat = [f.fat_g for f in matching_foods if f.fat_g is not None]
+            
+            avg_calories = sum(valid_calories) / len(valid_calories) if valid_calories else 0
+            avg_protein = sum(valid_protein) / len(valid_protein) if valid_protein else 0
+            avg_carbs = sum(valid_carbs) / len(valid_carbs) if valid_carbs else 0
+            avg_fat = sum(valid_fat) / len(valid_fat) if valid_fat else 0
             
             estimated_nutrition = {
                 "calories": round(avg_calories, 1),
