@@ -1,355 +1,447 @@
 from flask import Blueprint, request, jsonify
-from huggingface_hub import InferenceClient
 import os
 import base64
 from io import BytesIO
 from PIL import Image
+import logging
+import google.generativeai as genai
 
 from app.models.model import Food
 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 image_bp = Blueprint('image', __name__)
 
-# Initialize Hugging Face client
-HF_TOKEN = os.environ.get("HUGGINGFACE_API_TOKEN")
+# Initialize Google Gemini
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-if not HF_TOKEN:
-    print("WARNING: HUGGINGFACE_API_TOKEN not set in environment variables")
+if not GEMINI_API_KEY:
+    logger.warning("GEMINI_API_KEY not set in environment variables")
+    model = None
+    model_name_used = None
+else:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        
+        # List available models to find vision-capable ones
+        try:
+            available_models = genai.list_models()
+            vision_models = [
+                m.name for m in available_models 
+                if 'generateContent' in m.supported_generation_methods
+            ]
+            logger.info(f"Available vision models: {vision_models}")
+        except Exception as e:
+            logger.warning(f"Could not list models: {e}")
+            vision_models = []
+        
+        # Try known vision model names in order of preference
+        model_names = [
+            'gemini-1.5-pro',
+            'gemini-1.5-flash',
+            'gemini-pro-vision',
+            'gemini-1.5-pro-latest',
+            'gemini-1.5-flash-latest'
+        ]
+        
+        # If we found models from listing, prioritize those
+        if vision_models:
+            # Extract just the model name without 'models/' prefix
+            clean_vision_models = [m.replace('models/', '') for m in vision_models]
+            model_names = clean_vision_models + model_names
+        
+        model = None
+        model_name_used = None
+        for name in model_names:
+            try:
+                model = genai.GenerativeModel(name)
+                model_name_used = name
+                logger.info(f"Google Gemini initialized successfully with {name}")
+                break
+            except Exception as e:
+                logger.debug(f"Failed to initialize with {name}: {e}")
+                continue
+        
+        if not model:
+            logger.error("Could not initialize any Gemini model")
+    except Exception as e:
+        logger.error(f"Failed to configure Gemini: {e}")
+        model = None
+        model_name_used = None
 
-client = InferenceClient(token=HF_TOKEN) if HF_TOKEN else None
+# Stopwords for keyword extraction
+STOPWORDS = {
+    "with", "this", "that", "from", "have", "plate", "table", 
+    "white", "black", "food", "bowl", "dish", "served", "there",
+    "sitting", "top", "next", "image", "photo", "picture", "shows",
+    "contains", "features", "appears", "looks", "like", "here's",
+    "analysis", "visible", "estimated", "portion", "size", "approximately",
+    "preparation", "method", "main", "items", "ingredients", "single",
+    "substantial", "serving", "likely", "similar", "inches", "length"
+}
+
+# Constants
+MAX_IMAGE_SIZE = (1024, 1024)
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+
+
+def validate_and_process_image(file_source, is_base64=False):
+    """Validate and process image from file upload or base64"""
+    try:
+        if is_base64:
+            image_bytes = base64.b64decode(file_source)
+        else:
+            image_bytes = file_source.read()
+        
+        if len(image_bytes) > MAX_FILE_SIZE:
+            raise ValueError(f"Image too large. Max size: {MAX_FILE_SIZE / (1024*1024)}MB")
+        
+        image = Image.open(BytesIO(image_bytes))
+        
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # Resize if too large
+        if image.size[0] > MAX_IMAGE_SIZE[0] or image.size[1] > MAX_IMAGE_SIZE[1]:
+            image.thumbnail(MAX_IMAGE_SIZE, Image.Resampling.LANCZOS)
+        
+        return image
+        
+    except base64.binascii.Error:
+        raise ValueError("Invalid base64 encoding")
+    except Exception as e:
+        raise ValueError(f"Invalid image: {str(e)}")
+
+
+def extract_food_keywords(description, min_length=3, max_keywords=10):
+    """Extract relevant food keywords from description"""
+    # Convert to lowercase and split
+    text = description.lower()
+    
+    # Remove markdown formatting
+    text = text.replace('**', '').replace('*', '').replace('#', '')
+    
+    # Split into words
+    words = text.split()
+    
+    # Extract words that might be food items
+    keywords = []
+    food_indicators = {'main', 'ingredients', 'items', 'food'}
+    
+    for i, word in enumerate(words):
+        # Clean the word
+        clean_word = word.strip('.,!?;:()[]')
+        
+        # Skip stopwords and very short words
+        if clean_word in STOPWORDS or len(clean_word) <= min_length:
+            continue
+        
+        # Skip numbered lists
+        if clean_word.isdigit() or clean_word.endswith('.'):
+            continue
+        
+        # Prioritize words after food indicators
+        if i > 0 and words[i-1].strip('.,!?;:()[]') in food_indicators:
+            keywords.insert(0, clean_word)  # Add to front
+        else:
+            keywords.append(clean_word)
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_keywords = []
+    for k in keywords:
+        if k not in seen:
+            seen.add(k)
+            unique_keywords.append(k)
+    
+    return unique_keywords[:max_keywords]
+
+
+def search_matching_foods(keywords, limit_per_keyword=3, max_total=8):
+    """Search database for foods matching keywords with ranking"""
+    food_scores = {}  # Track foods and their relevance scores
+    
+    for idx, keyword in enumerate(keywords):
+        try:
+            # Search for foods matching this keyword
+            foods = Food.query.filter(
+                Food.name.ilike(f'%{keyword}%')
+            ).limit(limit_per_keyword).all()
+            
+            for food in foods:
+                food_id = food.id
+                
+                # Score based on keyword position (earlier = more important)
+                position_score = len(keywords) - idx
+                
+                # Score based on match quality
+                food_name_lower = food.name.lower()
+                keyword_lower = keyword.lower()
+                
+                if food_name_lower == keyword_lower:
+                    match_score = 10  # Exact match
+                elif food_name_lower.startswith(keyword_lower):
+                    match_score = 5   # Starts with keyword
+                else:
+                    match_score = 1   # Contains keyword
+                
+                total_score = position_score + match_score
+                
+                # Keep the highest score for each food
+                if food_id not in food_scores or food_scores[food_id]['score'] < total_score:
+                    food_scores[food_id] = {
+                        'food': food,
+                        'score': total_score,
+                        'keyword': keyword
+                    }
+        
+        except Exception as e:
+            logger.error(f"Database query error for keyword '{keyword}': {e}")
+    
+    # Sort by score (highest first) and return foods
+    sorted_foods = sorted(food_scores.values(), key=lambda x: x['score'], reverse=True)
+    unique_foods = [item['food'] for item in sorted_foods[:max_total]]
+    
+    return unique_foods
+
+
+def analyze_food_with_gemini(image, custom_prompt=None):
+    """
+    Analyze food image using Google Gemini Vision
+    
+    Args:
+        image: PIL Image object
+        custom_prompt: Optional custom prompt
+    
+    Returns:
+        Description string
+    """
+    if not model:
+        raise RuntimeError("Gemini model not initialized. Set GEMINI_API_KEY environment variable.")
+    
+    try:
+        logger.info(f"Analyzing image with Gemini, size: {image.size}")
+        
+        # Default prompt for food analysis
+        if not custom_prompt:
+            prompt = """Analyze this food image and provide a concise description.
+
+Focus on:
+1. Primary food item name (e.g., "Chicken Caesar Wrap", "Margherita Pizza")
+2. Main ingredients visible
+3. Portion size (small/medium/large)
+
+Format: Start with the food name, then list ingredients.
+Example: "Chicken Caesar Wrap with grilled chicken, romaine lettuce, parmesan cheese, Caesar dressing in a flour tortilla. Medium portion."
+
+Keep it brief and focused on food identification."""
+        else:
+            prompt = custom_prompt
+        
+        # Generate response
+        response = model.generate_content([prompt, image])
+        
+        if not response or not response.text:
+            raise RuntimeError("Gemini returned empty response")
+        
+        description = response.text.strip()
+        logger.info(f"Generated description: {description}")
+        
+        return description
+        
+    except Exception as e:
+        logger.error(f"Gemini analysis error: {type(e).__name__}: {e}", exc_info=True)
+        raise RuntimeError(f"Failed to analyze image: {str(e)}")
 
 
 @image_bp.route("/analyze", methods=["POST"])
-def analyze_food_image():
-    """
-    Analyze food image and return nutritional information
-    
-    Usage:
-    - Upload file: curl.exe -X POST http://localhost:5000/api/image/analyze -F "image=@burger.jpg"
-    
-    Returns: Food predictions with matching database entries
-    """
-    if not client:
-        return jsonify({"error": "Hugging Face API not configured. Set HUGGINGFACE_API_TOKEN"}), 500
+@image_bp.route("/analyze/vision", methods=["POST"])
+def analyze_with_vision_model():
+    """Analyze food using Google Gemini Vision"""
+    if not model:
+        return jsonify({
+            "error": "API not configured",
+            "message": "GEMINI_API_KEY environment variable not set",
+            "setup": "Get your free API key from https://aistudio.google.com/apikey"
+        }), 503
     
     try:
-        image_bytes = None
+        image = None
+        custom_prompt = None
         
         # Handle file upload
         if 'image' in request.files:
             file = request.files['image']
-            if file.filename == '':
+            if not file.filename:
                 return jsonify({"error": "No file selected"}), 400
             
-            # Read and convert to PNG format
-            try:
-                raw_bytes = file.read()
-                img = Image.open(BytesIO(raw_bytes))
-                
-                # Convert to PNG in memory
-                img_io = BytesIO()
-                img.save(img_io, format='PNG')
-                image_bytes = img_io.getvalue()
-            except Exception as img_error:
-                return jsonify({"error": f"Invalid image file: {str(img_error)}"}), 400
+            custom_prompt = request.form.get('prompt')
+            image = validate_and_process_image(file)
         
-        # Handle base64 image
+        # Handle JSON with base64
         elif request.is_json:
             data = request.get_json()
-            if 'image_base64' in data:
-                try:
-                    raw_bytes = base64.b64decode(data['image_base64'])
-                    img = Image.open(BytesIO(raw_bytes))
-                    
-                    # Convert to PNG
-                    img_io = BytesIO()
-                    img.save(img_io, format='PNG')
-                    image_bytes = img_io.getvalue()
-                except Exception as e:
-                    return jsonify({"error": f"Invalid base64 image: {str(e)}"}), 400
+            
+            if not data or 'image_base64' not in data:
+                return jsonify({"error": "No image_base64 provided in JSON"}), 400
+            
+            custom_prompt = data.get('prompt')
+            image = validate_and_process_image(data['image_base64'], is_base64=True)
         
-        if not image_bytes:
+        else:
             return jsonify({
-                "error": "No image provided. Send 'image' file or 'image_base64' in JSON"
+                "error": "Invalid request format. Use multipart/form-data or JSON with image_base64"
             }), 400
         
-        # Call Hugging Face food classification model
-        try:
-            result = client.image_classification(
-                image=image_bytes,
-                model="nateraw/food"
-            )
-        except Exception as model_error:
-            return jsonify({
-                "error": "Model inference failed",
-                "details": str(model_error),
-                "suggestion": "Check API token and model availability"
-            }), 503
+        # Analyze with Gemini
+        description = analyze_food_with_gemini(image, custom_prompt)
         
-        # Get top 5 predictions
-        if not result or len(result) == 0:
-            return jsonify({"error": "No predictions returned from model"}), 500
-            
-        predictions = result[:5]
-        
-        # Search database for matching foods
-        food_matches = []
-        for pred in predictions:
-            food_name = pred['label'].replace('_', ' ').replace('-', ' ')
-            confidence = pred['score']
-            
-            # Find similar foods in database
-            matching_foods = Food.query.filter(
-                Food.name.ilike(f'%{food_name}%')
-            ).limit(3).all()
-            
-            food_matches.append({
-                "prediction": food_name,
-                "confidence": round(confidence * 100, 2),
-                "matches": [food.to_dict() for food in matching_foods] if matching_foods else []
-            })
+        # Extract keywords and search foods
+        keywords = extract_food_keywords(description)
+        matching_foods = search_matching_foods(keywords)
         
         return jsonify({
             "success": True,
-            "model": "nateraw/food (Food-101)",
-            "predictions": food_matches
+            "model": model_name_used or "gemini-vision",
+            "description": description,
+            "extracted_keywords": keywords,
+            "suggested_foods": [food.to_dict() for food in matching_foods],
+            "count": len(matching_foods),
+            "tip": "Use the suggested foods with /analyze/nutrition endpoint for detailed nutritional info"
         }), 200
         
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 503
     except Exception as e:
-        return jsonify({"error": f"Analysis failed: {str(e)}"}), 500
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        return jsonify({"error": "Internal server error", "details": str(e)}), 500
 
 
 @image_bp.route("/analyze/advanced", methods=["POST"])
 def analyze_food_advanced():
-    """
-    Detailed food analysis using Vision-Language Model
-    
-    Uses a more powerful model to describe the food and estimate portions
-    """
-    if not client:
-        return jsonify({"error": "Hugging Face API not configured"}), 500
-    
-    try:
-        image_input = None
-        
-        # Handle file upload
-        if 'image' in request.files:
-            file = request.files['image']
-            if file.filename == '':
-                return jsonify({"error": "No file selected"}), 400
-            try:
-                file.seek(0)
-                image_data = Image.open(file.stream)
-                image_data.verify()
-                file.seek(0)
-                image_input = file.stream
-            except Exception as img_error:
-                return jsonify({"error": f"Invalid image file: {str(img_error)}"}), 400
-        
-        # Handle base64 image
-        elif request.is_json:
-            data = request.get_json()
-            if 'image_base64' in data:
-                try:
-                    image_bytes = base64.b64decode(data['image_base64'])
-                    image_data = Image.open(BytesIO(image_bytes))
-                    image_data.verify()
-                    image_input = BytesIO(image_bytes)
-                except Exception as e:
-                    return jsonify({"error": f"Invalid base64 image: {str(e)}"}), 400
-        
-        if not image_input:
-            return jsonify({"error": "No image provided"}), 400
-        
-        # Use vision language model for detailed analysis
-        try:
-            result = client.image_to_text(
-                image=image_input,
-                model="Salesforce/blip-image-captioning-large"
-            )
-        except Exception as model_error:
-            return jsonify({
-                "error": "Vision model inference failed",
-                "details": str(model_error)
-            }), 503
-        
-        description = result if result else "Unable to generate description"
-        
-        # Extract food keywords from description
-        keywords = [word for word in description.lower().split() if len(word) > 3]
-        
-        # Search database for matching foods
-        matching_foods = []
-        for keyword in keywords[:5]:
-            foods = Food.query.filter(
-                Food.name.ilike(f'%{keyword}%')
-            ).limit(2).all()
-            matching_foods.extend(foods)
-        
-        # Remove duplicates
-        unique_foods = list({f.id: f for f in matching_foods}.values())
-        
+    """Detailed food analysis with nutritional estimation"""
+    if not model:
         return jsonify({
-            "success": True,
-            "model": "Salesforce/blip-image-captioning-large",
-            "description": description,
-            "suggested_foods": [food.to_dict() for food in unique_foods[:5]]
-        }), 200
-        
-    except Exception as e:
-        return jsonify({"error": f"Analysis failed: {str(e)}"}), 500
-
-
-@image_bp.route("/analyze/nutrition", methods=["POST"])
-def analyze_with_nutrition():
-    """
-    Combined analysis: Food detection + Nutrition estimation
-    
-    Uses both classification and vision models for best results
-    """
-    if not client:
-        return jsonify({"error": "Hugging Face API not configured"}), 500
+            "error": "API not configured",
+            "message": "GEMINI_API_KEY environment variable not set"
+        }), 503
     
     try:
-        image_input = None
+        image = None
         
         if 'image' in request.files:
             file = request.files['image']
-            if file.filename == '':
+            if not file.filename:
                 return jsonify({"error": "No file selected"}), 400
-            try:
-                file.seek(0)
-                image_data = Image.open(file.stream)
-                image_data.verify()
-                file.seek(0)
-                image_input = file.stream
-            except Exception as img_error:
-                return jsonify({"error": f"Invalid image file: {str(img_error)}"}), 400
+            image = validate_and_process_image(file)
         
         elif request.is_json:
             data = request.get_json()
-            if 'image_base64' in data:
-                try:
-                    image_bytes = base64.b64decode(data['image_base64'])
-                    image_data = Image.open(BytesIO(image_bytes))
-                    image_data.verify()
-                    image_input = BytesIO(image_bytes)
-                except Exception as e:
-                    return jsonify({"error": f"Invalid base64 image: {str(e)}"}), 400
+            if not data or 'image_base64' not in data:
+                return jsonify({"error": "No image_base64 provided"}), 400
+            image = validate_and_process_image(data['image_base64'], is_base64=True)
         
-        if not image_input:
-            return jsonify({"error": "No image provided"}), 400
-        
-        # Step 1: Classify food
-        try:
-            classification = client.image_classification(
-                image=image_input,
-                model="nateraw/food"
-            )
-        except Exception as model_error:
-            return jsonify({
-                "error": "Classification failed",
-                "details": str(model_error)
-            }), 503
-        
-        if not classification or len(classification) == 0:
-            return jsonify({"error": "No food detected in image"}), 404
-            
-        top_prediction = classification[0]
-        food_name = top_prediction['label'].replace('_', ' ')
-        confidence = top_prediction['score']
-        
-        # Step 2: Find matching foods in database
-        matching_foods = Food.query.filter(
-            Food.name.ilike(f'%{food_name}%')
-        ).limit(5).all()
-        
-        # Calculate average nutrition if multiple matches
-        if matching_foods and len(matching_foods) > 0:
-            # Filter out None values before calculating averages
-            valid_calories = [f.calories for f in matching_foods if f.calories is not None]
-            valid_protein = [f.protein_g for f in matching_foods if f.protein_g is not None]
-            valid_carbs = [f.carbs_g for f in matching_foods if f.carbs_g is not None]
-            valid_fat = [f.fat_g for f in matching_foods if f.fat_g is not None]
-            
-            avg_calories = sum(valid_calories) / len(valid_calories) if valid_calories else 0
-            avg_protein = sum(valid_protein) / len(valid_protein) if valid_protein else 0
-            avg_carbs = sum(valid_carbs) / len(valid_carbs) if valid_carbs else 0
-            avg_fat = sum(valid_fat) / len(valid_fat) if valid_fat else 0
-            
-            estimated_nutrition = {
-                "calories": round(avg_calories, 1),
-                "protein_g": round(avg_protein, 1),
-                "carbs_g": round(avg_carbs, 1),
-                "fat_g": round(avg_fat, 1)
-            }
         else:
-            estimated_nutrition = None
+            return jsonify({"error": "Invalid request format"}), 400
+        
+        # Advanced prompt for more details
+        advanced_prompt = """Analyze this food image and provide:
+        1. Main food items (be specific, e.g., "cheeseburger" not just "burger")
+        2. Visible ingredients
+        3. Preparation method (fried, grilled, baked, etc.)
+        4. Estimated portion size
+        
+        Be concise and specific about the food items."""
+        
+        description = analyze_food_with_gemini(image, advanced_prompt)
+        
+        keywords = extract_food_keywords(description)
+        matching_foods = search_matching_foods(keywords)
         
         return jsonify({
             "success": True,
-            "food_detected": food_name,
-            "confidence": round(confidence * 100, 2),
-            "estimated_nutrition": estimated_nutrition,
-            "database_matches": [food.to_dict() for food in matching_foods],
-            "note": "Nutrition is estimated based on similar foods. Actual values depend on portion size and preparation."
+            "model": model_name_used or "gemini-vision",
+            "description": description,
+            "extracted_keywords": keywords,
+            "suggested_foods": [food.to_dict() for food in matching_foods],
+            "count": len(matching_foods)
         }), 200
         
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 503
     except Exception as e:
-        return jsonify({"error": f"Analysis failed: {str(e)}"}), 500
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 
 @image_bp.route("/models", methods=["GET"])
 def get_models_info():
-    """List available food analysis models and their capabilities"""
+    """List available models"""
     return jsonify({
         "models": [
             {
-                "endpoint": "/api/image/analyze",
-                "model": "nateraw/food",
-                "type": "Classification",
-                "speed": "Fast (1-2s)",
-                "accuracy": "High (~85%)",
-                "categories": "101 food categories",
-                "best_for": "Quick food identification"
-            },
-            {
-                "endpoint": "/api/image/analyze/advanced",
-                "model": "Salesforce/blip-image-captioning-large",
-                "type": "Vision-Language",
-                "speed": "Medium (3-5s)",
-                "accuracy": "Very High",
-                "features": "Describes portions, ingredients, preparation",
-                "best_for": "Detailed food analysis"
-            },
-            {
-                "endpoint": "/api/image/analyze/nutrition",
-                "model": "Combined (nateraw/food + database)",
-                "type": "Hybrid",
-                "speed": "Fast (1-2s)",
-                "accuracy": "High",
-                "features": "Food ID + Nutrition estimation",
-                "best_for": "Getting nutritional values"
+                "name": "gemini-1.5-flash-latest",
+                "provider": "Google",
+                "type": "Vision-Language Model",
+                "speed": "Very Fast (1-2s)",
+                "accuracy": "Excellent",
+                "features": [
+                    "Detailed food description",
+                    "Ingredient identification",
+                    "Portion estimation",
+                    "Preparation method detection"
+                ],
+                "cost": "Free (15 requests/min, 1500 requests/day)",
+                "endpoint": "/api/image/analyze"
             }
         ],
-        "recommendations": {
-            "quick_identification": "Use /analyze",
-            "detailed_description": "Use /analyze/advanced",
-            "nutrition_tracking": "Use /analyze/nutrition (RECOMMENDED)"
+        "setup": {
+            "step1": "Get free API key from https://aistudio.google.com/apikey",
+            "step2": "Set environment variable: GEMINI_API_KEY=your_key_here",
+            "step3": "Install package: pip install google-generativeai"
         }
     }), 200
 
 
 @image_bp.route("/test", methods=["GET"])
 def test_api():
-    """Test if Hugging Face API is configured correctly"""
-    if not HF_TOKEN:
+    """Test if Gemini API is configured"""
+    if not GEMINI_API_KEY:
         return jsonify({
             "configured": False,
-            "message": "HUGGINGFACE_API_TOKEN not found in environment"
-        }), 500
+            "status": "error",
+            "message": "GEMINI_API_KEY not found in environment",
+            "setup": "Get your free key from https://aistudio.google.com/apikey"
+        }), 503
+    
+    if not model:
+        return jsonify({
+            "configured": False,
+            "status": "error",
+            "message": "Gemini model initialization failed"
+        }), 503
     
     return jsonify({
         "configured": True,
-        "message": "Hugging Face API ready",
-        "token_prefix": HF_TOKEN[:10] + "..."
+        "status": "ok",
+        "message": "Google Gemini Vision API ready",
+        "model": model_name_used or "gemini-vision",
+        "rate_limits": "15 requests/min, 1500 requests/day (free tier)"
+    }), 200
+
+
+@image_bp.route("/health", methods=["GET"])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        "status": "healthy",
+        "service": "image-analysis",
+        "api_configured": model is not None,
+        "provider": "Google Gemini"
     }), 200

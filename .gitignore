@@ -132,3 +132,11 @@ dmypy.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Image files(Testing)
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff

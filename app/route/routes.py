@@ -45,6 +45,78 @@ def get_food(id):
         return jsonify(food_id.to_dict()), 200
     else:
         return jsonify({"error": "Food not found"}), 404
+
+
+# This endpoint gets foods with similar nutritional profiles
+# Path parameter: id (food identifier)
+# Query parameter: limit (number of similar foods to return, default 5)
+# Returns: List of similar foods with similarity scores based on nutritional values
+@main_bp.route("/food/<string:id>/similar", methods=["GET"])
+def get_similar_foods(id):
+    """Get foods with similar nutritional profiles"""
+    try:
+        limit = request.args.get('limit', 5, type=int)
+        
+        # Get the target food
+        food = Food.query.filter_by(id=id).first()
+        if not food:
+            return jsonify({'error': 'Food not found'}), 404
+        
+        # Get all foods except the current one
+        all_foods = Food.query.filter(Food.id != id).all()
+        
+        if not all_foods:
+            return jsonify({'similar_foods': []})
+        
+        # Calculate similarity scores based on nutritional values
+        similarities = []
+        for other_food in all_foods:
+            # Skip foods with missing nutritional data
+            if (food.calories is None or other_food.calories is None or
+                food.protein_g is None or other_food.protein_g is None or
+                food.carbs_g is None or other_food.carbs_g is None or
+                food.fat_g is None or other_food.fat_g is None):
+                continue
+            
+            # Calculate Euclidean distance for key nutrients
+            distance = (
+                ((food.calories - other_food.calories) / 100) ** 2 +
+                ((food.protein_g - other_food.protein_g) / 10) ** 2 +
+                ((food.carbs_g - other_food.carbs_g) / 10) ** 2 +
+                ((food.fat_g - other_food.fat_g) / 10) ** 2
+            ) ** 0.5
+            
+            similarities.append({
+                'food': other_food,
+                'similarity_score': 1 / (1 + distance)  # Convert distance to similarity
+            })
+        
+        # Sort by similarity score (highest first)
+        similarities.sort(key=lambda x: x['similarity_score'], reverse=True)
+        
+        # Get top N similar foods
+        similar_foods = []
+        for item in similarities[:limit]:
+            similar_foods.append({
+                'id': item['food'].id,
+                'name': item['food'].name,
+                'category_name': item['food'].category_name,
+                'brand_name': item['food'].brand_name,
+                'calories': item['food'].calories,
+                'protein_g': item['food'].protein_g,
+                'carbs_g': item['food'].carbs_g,
+                'fat_g': item['food'].fat_g,
+                'similarity_score': round(item['similarity_score'], 3)
+            })
+        
+        return jsonify({
+            'food_id': id,
+            'food_name': food.name,
+            'similar_foods': similar_foods
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
     
     
 # This endpoint searches for foods by name using a query parameter
